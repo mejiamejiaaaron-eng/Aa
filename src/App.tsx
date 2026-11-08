@@ -9,16 +9,15 @@ import {
 import {
   collection,
   getDocs,
-  getDoc,
-  setDoc,
   addDoc,
   updateDoc,
   deleteDoc,
   doc
 } from 'firebase/firestore';
 import { auth, db } from './firebase';
+import { supabase, SUPABASE_URL, SUPABASE_KEY } from './supabase.ts';
 import { uploadToR2, uploadCoverToR2, uploadFolderCoverToR2 } from './r2Client';
-export { auth, db };
+export { supabase, SUPABASE_URL, SUPABASE_KEY, auth, db };
 import {
   Play,
   Pause,
@@ -831,10 +830,20 @@ export default function App() {
     }
 
     try {
-      // 1. Guardar en Firestore colección 'folders'
-      await setDoc(
-        doc(db, 'folders', folderToRename.id),
-        {
+      // 1. Guardar en tabla folders en Supabase
+      const { error: fErr } = await supabase.from('folders').upsert({
+        id: folderToRename.id,
+        titulo: cleanTitle,
+        subtitulo: folderToRename.subtitulo || '',
+        descripcion: folderToRename.descripcion || '',
+        cover_key: folderToRename.coverKey || '',
+        badge: folderToRename.badge || '',
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+
+      if (fErr) {
+        // Fallback en playlists
+        await supabase.from('playlists').upsert({
           id: folderToRename.id,
           titulo: cleanTitle,
           subtitulo: folderToRename.subtitulo || '',
@@ -842,11 +851,10 @@ export default function App() {
           cover_key: folderToRename.coverKey || '',
           badge: folderToRename.badge || '',
           updated_at: new Date().toISOString()
-        },
-        { merge: true }
-      );
+        }, { onConflict: 'id' });
+      }
     } catch (err) {
-      console.warn('Nota al actualizar título de carpeta en Firestore:', err);
+      console.warn('Nota al actualizar título de carpeta en Supabase:', err);
     } finally {
       setIsSavingFolderTitle(false);
       setFolderToRename(null);
@@ -897,25 +905,31 @@ export default function App() {
         });
       }
 
-      // Guardar URL pública en Firestore (colección 'folders')
+      // Guardar URL pública en Supabase (tabla folders y playlists)
       try {
-        await setDoc(
-          doc(db, 'folders', folderForCoverUpload.id),
-          {
+        const { error: fErr } = await supabase.from('folders').upsert({
+          id: folderForCoverUpload.id,
+          titulo: folderForCoverUpload.titulo,
+          cover_key: publicUrl,
+          subtitulo: folderForCoverUpload.subtitulo || '',
+          descripcion: folderForCoverUpload.descripcion || '',
+          badge: folderForCoverUpload.badge || '',
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'id' });
+
+        if (fErr) {
+          await supabase.from('playlists').upsert({
             id: folderForCoverUpload.id,
             titulo: folderForCoverUpload.titulo,
             cover_key: publicUrl,
-            coverUrl: publicUrl,
-            cover_url: publicUrl,
             subtitulo: folderForCoverUpload.subtitulo || '',
             descripcion: folderForCoverUpload.descripcion || '',
             badge: folderForCoverUpload.badge || '',
             updated_at: new Date().toISOString()
-          },
-          { merge: true }
-        );
+          }, { onConflict: 'id' });
+        }
       } catch (dbErr) {
-        console.warn('Nota al guardar portada en Firestore:', dbErr);
+        console.warn('Nota al guardar portada en Supabase:', dbErr);
       }
 
       triggerToast(`¡Foto de portada actualizada para "${folderForCoverUpload.titulo}"!`, 'success');
@@ -966,10 +980,22 @@ export default function App() {
     saveFolders(updated);
 
     try {
-      // Guardar en Firestore colección 'folders' con la portada automática de Unsplash
-      await setDoc(
-        doc(db, 'folders', newId),
-        {
+      // Guardar en tabla folders en Supabase con la portada automática de Unsplash
+      const { error: fErr } = await supabase.from('folders').upsert({
+        id: newId,
+        titulo: cleanTitle,
+        subtitulo: newFolderItem.subtitulo,
+        descripcion: newFolderItem.descripcion,
+        cover_key: autoCover,
+        cover_url: autoCover,
+        badge: 'Playlist',
+        position: updated.length,
+        created_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+
+      if (fErr) {
+        // Fallback en playlists
+        await supabase.from('playlists').upsert({
           id: newId,
           titulo: cleanTitle,
           subtitulo: newFolderItem.subtitulo,
@@ -977,13 +1003,11 @@ export default function App() {
           cover_key: autoCover,
           cover_url: autoCover,
           badge: 'Playlist',
-          position: updated.length,
           created_at: new Date().toISOString()
-        },
-        { merge: true }
-      );
+        }, { onConflict: 'id' });
+      }
     } catch (err) {
-      console.warn('Nota al crear carpeta en Firestore:', err);
+      console.warn('Nota al crear carpeta en Supabase:', err);
     } finally {
       setIsCreatingFolder(false);
       setShowCreateFolderModal(false);
@@ -1438,15 +1462,24 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     setTimeout(() => setSqlCopiedAppSettings(false), 3000);
   };
 
-  // Cargar configuración de app_settings desde Firestore
+  // Cargar configuración de app_settings desde Supabase
   const cargarAppSettings = async () => {
     setLoadingAppSettings(true);
     try {
-      const snap = await getDoc(doc(db, 'app_settings', 'global'));
-      if (snap.exists()) {
-        const data = snap.data();
+      const { data, error } = await supabase
+        .from('app_settings')
+        .select('setting_name, is_enabled');
+
+      if (error) {
+        console.warn('Nota cargando app_settings desde Supabase:', error.message);
+      } else if (data && data.length > 0) {
         setAppSettings((prev) => {
-          const next = { ...prev, ...data };
+          const next = { ...prev };
+          data.forEach((row: { setting_name: string; is_enabled: boolean }) => {
+            if (row.setting_name in next) {
+              (next as any)[row.setting_name] = Boolean(row.is_enabled);
+            }
+          });
           try {
             localStorage.setItem('spotyy_app_settings_v1', JSON.stringify(next));
           } catch {}
@@ -1454,7 +1487,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         });
       }
     } catch (err) {
-      console.warn('Excepción al cargar app_settings desde Firestore:', err);
+      console.warn('Excepción al cargar app_settings:', err);
     } finally {
       setLoadingAppSettings(false);
     }
@@ -1478,12 +1511,19 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
     setSavingSettingKey(key);
     try {
-      await setDoc(
-        doc(db, 'app_settings', 'global'),
-        { [key]: newVal, updated_at: new Date().toISOString() },
-        { merge: true }
-      );
-      triggerToast('Configuración actualizada correctamente', 'success');
+      const { error } = await supabase
+        .from('app_settings')
+        .upsert(
+          { setting_name: key, is_enabled: newVal, updated_at: new Date().toISOString() },
+          { onConflict: 'setting_name' }
+        );
+
+      if (error) {
+        console.warn('Error al guardar en tabla app_settings:', error.message);
+        triggerToast('Guardado localmente. Recuerda crear la tabla app_settings con el botón SQL.', 'info');
+      } else {
+        triggerToast('Configuración actualizada correctamente', 'success');
+      }
     } catch (err: any) {
       console.warn('Excepción al guardar en app_settings:', err);
     } finally {
@@ -1496,15 +1536,24 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     document.title = appName;
   }, [appName]);
 
-  // Consultar si un usuario está en la colección blocked_users
+  // Consultar si un usuario está en la tabla blocked_users
   const checkIsUserBlocked = async (userEmail?: string | null): Promise<boolean> => {
     if (!userEmail) return false;
     try {
       const clean = userEmail.trim().toLowerCase();
-      const snap = await getDoc(doc(db, 'blocked_users', clean));
-      return snap.exists();
+      const { data, error } = await supabase
+        .from('blocked_users')
+        .select('email')
+        .eq('email', clean)
+        .maybeSingle();
+
+      if (error) {
+        console.warn('Nota verificando blocked_users:', error.message);
+        return false;
+      }
+      return !!data;
     } catch (e) {
-      console.warn('Excepción al consultar blocked_users en Firestore:', e);
+      console.warn('Excepción al consultar blocked_users:', e);
       return false;
     }
   };
@@ -1513,18 +1562,24 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
   const cargarUsuariosBloqueados = async () => {
     setLoadingBlockedUsers(true);
     try {
-      const snap = await getDocs(collection(db, 'blocked_users'));
-      const list: any[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() }));
-      setBlockedUsers(list);
+      const { data, error } = await supabase
+        .from('blocked_users')
+        .select('id, email, blocked_by, reason, created_at')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.warn('Nota cargando blocked_users:', error.message);
+      } else if (data) {
+        setBlockedUsers(data);
+      }
     } catch (err) {
-      console.warn('Excepción al cargar usuarios bloqueados desde Firestore:', err);
+      console.warn('Excepción al cargar usuarios bloqueados:', err);
     } finally {
       setLoadingBlockedUsers(false);
     }
   };
 
-  // Bloquear usuario (Kick) y guardar en Firestore
+  // Bloquear usuario (Kick) y guardar en la tabla blocked_users
   const bloquearUsuario = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const clean = newBlockEmail.trim().toLowerCase();
@@ -1538,11 +1593,18 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     }
 
     try {
-      await setDoc(doc(db, 'blocked_users', clean), {
-        email: clean,
-        blocked_by: 'admin',
-        created_at: new Date().toISOString()
-      });
+      const { error } = await supabase.from('blocked_users').insert([
+        { email: clean, created_at: new Date().toISOString() }
+      ]);
+
+      if (error) {
+        if (error.code === '23505' || error.message.includes('duplicate')) {
+          alert(`El usuario ${clean} ya se encuentra bloqueado.`);
+        } else {
+          alert(`Error al guardar en la tabla blocked_users:\n\n${error.message}\n\nAsegúrate de que la tabla "blocked_users" exista en Supabase con columnas (email text, created_at timestamp).`);
+        }
+        return;
+      }
 
       setNewBlockEmail('');
       triggerToast(`Usuario ${clean} bloqueado con éxito`, 'success');
@@ -1552,11 +1614,19 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     }
   };
 
-  // Desbloquear usuario de Firestore
+  // Desbloquear usuario de la tabla blocked_users
   const desbloquearUsuario = async (correo: string) => {
     try {
-      const clean = correo.trim().toLowerCase();
-      await deleteDoc(doc(db, 'blocked_users', clean));
+      const { error } = await supabase
+        .from('blocked_users')
+        .delete()
+        .eq('email', correo);
+
+      if (error) {
+        alert(`Error al desbloquear usuario: ${error.message}`);
+        return;
+      }
+
       triggerToast(`Usuario ${correo} desbloqueado`, 'success');
       cargarUsuariosBloqueados();
     } catch (err: any) {
@@ -1621,6 +1691,34 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       }
     });
 
+    const channel = supabase
+      .channel('songs-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'songs' }, () => {
+        cargarCanciones();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'canciones' }, () => {
+        cargarCanciones();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'playlists' }, () => {
+        cargarCarpetasDesdeSupabase();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'folders' }, () => {
+        cargarCarpetasDesdeSupabase();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'user_preferences' }, () => {
+        cargarCarpetasDesdeSupabase();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'user_settings' }, () => {
+        cargarCarpetasDesdeSupabase();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'playlist_songs' }, () => {
+        cargarCanciones();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, () => {
+        cargarAppSettings();
+      })
+      .subscribe();
+
     const checkStandalone =
       window.matchMedia('(display-mode: standalone)').matches ||
       (window.navigator as any).standalone === true;
@@ -1640,7 +1738,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     };
     window.addEventListener('keydown', handleKeyDown);
 
-    // SINCRONIZACIÓN AUTOMÁTICA: Refrescar datos al recuperar el foco o volver a la app
+    // SINCRONIZACIÓN FORZADA AUTOMÁTICA: Refrescar datos desde Supabase al recuperar el foco o volver a la app
     const handleFocusSync = () => {
       refrescarDatosRef.current?.(false);
     };
@@ -1656,6 +1754,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
     return () => {
       unsubscribeAuth();
+      supabase.removeChannel(channel);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
       window.removeEventListener('focus', handleFocusSync);
@@ -1802,17 +1901,51 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
   const cargarCanciones = async (esReintento = false, forzarRecarga = false) => {
     try {
-      let dbSongs: any[] = [];
+      let dbSongs: any[] | null = null;
+      let dbError: any = null;
 
-      // 1. Cargar exclusivamente desde la colección 'songs' de Firebase Firestore
+      // 1. Cargar desde la colección 'songs' de Firebase Firestore
       try {
         const querySnapshot = await getDocs(collection(db, 'songs'));
+        const firestoreSongs: any[] = [];
         querySnapshot.forEach((docSnap) => {
-          dbSongs.push({ id: docSnap.id, ...docSnap.data() });
+          firestoreSongs.push({ id: docSnap.id, ...docSnap.data() });
         });
-        console.log('dbSongs (recibidas de Firestore):', dbSongs.length);
+        if (firestoreSongs.length > 0) {
+          dbSongs = firestoreSongs;
+          console.log('dbSongs (recibidas de Firestore):', firestoreSongs.length);
+        }
       } catch (fErr: any) {
         console.warn('Nota al consultar canciones en Firestore:', fErr?.message || fErr);
+      }
+
+      // 2. Si no hay canciones en Firestore todavía, consultar Supabase como fallback / migración
+      if (!dbSongs || dbSongs.length === 0) {
+        const { data: resSongs, error: errSongs } = await supabase
+          .from('songs')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(5000);
+
+        dbSongs = resSongs;
+        dbError = errSongs;
+
+        if (dbError || !dbSongs || dbSongs.length === 0) {
+          try {
+            const { data: resCanciones, error: errCanciones } = await supabase
+              .from('canciones')
+              .select('*')
+              .order('created_at', { ascending: false })
+              .limit(5000);
+
+            if (!errCanciones && resCanciones && resCanciones.length > 0) {
+              dbSongs = resCanciones;
+              dbError = null;
+            }
+          } catch (_) {}
+        }
+
+        console.log('dbSongs (recibidas de Supabase fallback):', dbSongs ? dbSongs.length : 0);
       }
 
       // Filtrar filas de configuración interna del sistema (__spotyy_) y normalizar las canciones
@@ -1833,14 +1966,11 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           let cleanArtistName = (row.artist || row.artista || row.performer || '').trim();
           if (
             !cleanArtistName ||
-            cleanArtistName.toLowerCase() === 'artista' ||
             cleanArtistName.toLowerCase() === 'artista desconocido' ||
             cleanArtistName.toLowerCase() === 'desconocido' ||
             cleanArtistName.toLowerCase() === 'unknown'
           ) {
-            cleanArtistName = parsedName.artist && parsedName.artist.toLowerCase() !== 'artista'
-              ? parsedName.artist
-              : 'Artista Desconocido';
+            cleanArtistName = parsedName.artist || 'Artista';
           }
 
           let cleanTitleName = (row.title || row.titulo || '').trim();
@@ -1851,7 +1981,6 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           ) {
             cleanTitleName = parsedName.title || 'Canción';
           }
-          cleanTitleName = limpiarTituloCancion(cleanTitleName);
 
           const coverUrl = row.cover_url || row.cover || '';
 
@@ -1881,79 +2010,136 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       setSongs(listaCompleta);
       setCanciones(listaCompleta);
 
-      // Sincronizar canciones en las carpetas según su folder_id
-      if (cancionesBD.length > 0) {
-        setFolders((prevFolders) => {
-          const existingFolderIds = new Set(prevFolders.map((f) => f.id));
-          const newFoldersFromSongs: AudioFolder[] = [];
+        // La canción actual inicia en null para evitar autoplay al entrar a la app
 
-          for (const c of cancionesBD) {
-            const fId = c.folder_id || 'tus_me_gusta';
-            if (fId && !existingFolderIds.has(fId)) {
-              existingFolderIds.add(fId);
-              const prettyTitle = fId.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
-              const autoCover = obtenerPortadaUnsplashCarpeta(prettyTitle);
-              newFoldersFromSongs.push({
-                id: fId,
-                titulo: prettyTitle,
-                subtitulo: `Colección de ${prettyTitle}`,
-                descripcion: `Carpeta ${prettyTitle}`,
-                coverKey: autoCover,
-                coverUrl: autoCover,
-                badge: prettyTitle,
-                canciones: []
-              });
-            }
+        // Consultar relaciones en tabla intermedia playlist_songs si existe
+        let playlistSongsMap: Record<string, Set<string>> = {};
+        try {
+          const { data: rels } = await supabase
+            .from('playlist_songs')
+            .select('playlist_id, song_id');
+          if (rels && rels.length > 0) {
+            rels.forEach((r: any) => {
+              if (!playlistSongsMap[r.playlist_id]) {
+                playlistSongsMap[r.playlist_id] = new Set();
+              }
+              playlistSongsMap[r.playlist_id].add(String(r.song_id));
+            });
           }
+        } catch {}
 
-          const allFolders = [...prevFolders, ...newFoldersFromSongs];
-          const updated = allFolders.map((f) => {
-            const cancionesParaEstaCarpeta = cancionesBD.filter(
-              (c) => (c.folder_id || 'tus_me_gusta') === f.id
-            );
-            return {
-              ...f,
-              canciones: cancionesParaEstaCarpeta
-            };
+        // Sincronizar canciones en las carpetas según su folder_id
+        if (cancionesBD.length > 0) {
+          setFolders((prevFolders) => {
+            const existingFolderIds = new Set(prevFolders.map((f) => f.id));
+            const newFoldersFromSongs: AudioFolder[] = [];
+
+            for (const c of cancionesBD) {
+              const fId = c.folder_id || 'tus_me_gusta';
+              if (fId && !existingFolderIds.has(fId)) {
+                existingFolderIds.add(fId);
+                const prettyTitle = fId.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+                const autoCover = obtenerPortadaUnsplashCarpeta(prettyTitle);
+                newFoldersFromSongs.push({
+                  id: fId,
+                  titulo: prettyTitle,
+                  subtitulo: `Colección de ${prettyTitle}`,
+                  descripcion: `Carpeta ${prettyTitle}`,
+                  coverKey: autoCover,
+                  coverUrl: autoCover,
+                  badge: prettyTitle,
+                  canciones: []
+                });
+              }
+            }
+
+            const allFolders = [...prevFolders, ...newFoldersFromSongs];
+            const updated = allFolders.map((f) => {
+              const cancionesParaEstaCarpeta = cancionesBD.filter(
+                (c) =>
+                  (c.folder_id || 'tus_me_gusta') === f.id ||
+                  (playlistSongsMap[f.id] && playlistSongsMap[f.id].has(String(c.id)))
+              );
+              return {
+                ...f,
+                canciones: cancionesParaEstaCarpeta
+              };
+            });
+
+            return updated;
           });
-
-          return updated;
-        });
-      }
+        }
     } catch (err) {
-      console.error('Error inesperado al cargar canciones desde Firebase:', err);
-    } finally {
-      // CRÍTICO: Siempre desactivar loading en el bloque finally
-      setIsLoading(false);
+      console.error('Error inesperado al cargar canciones:', err);
     }
   };
 
   // ==========================================
-  // CARGA Y SINCRONIZACIÓN DE CARPETAS Y PREFERENCIAS (FIREBASE FIRESTORE)
+  // CARGA Y SINCRONIZACIÓN DE CARPETAS Y PREFERENCIAS (SUPABASE)
+  // Regla estricta: NO usar localStorage para el orden.
+  // 1. Cargar orden global desde 'playlists' (o 'folders').
+  // 2. Si el usuario tiene sesión, buscar preferencia en 'user_preferences' (playlist_order).
+  // 3. Aplicar orden personal si existe; de lo contrario mantener orden global de Supabase.
+  // 4. Guardar resultado directamente en el estado de React (setFolders).
   // ==========================================
   const cargarCarpetasDesdeSupabase = async (customUserId?: string, forzarSoloGlobal = false) => {
     try {
       let dbPlaylists: any[] | null = null;
 
-      // Cargar carpetas desde Firestore colección 'folders'
+      // 1. Cargar desde la tabla principal 'playlists' ordenada por order_index o position si existe
       try {
-        const snap = await getDocs(collection(db, 'folders'));
-        if (!snap.empty) {
-          dbPlaylists = [];
-          snap.forEach((d) => dbPlaylists!.push({ id: d.id, ...d.data() }));
+        const { data: pData, error: pErr } = await supabase
+          .from('playlists')
+          .select('*')
+          .order('order_index', { ascending: true });
+
+        if (!pErr && pData && pData.length > 0) {
+          dbPlaylists = pData;
+        } else {
+          const { data: pDataPos, error: pErrPos } = await supabase
+            .from('playlists')
+            .select('*')
+            .order('position', { ascending: true });
+
+          if (!pErrPos && pDataPos && pDataPos.length > 0) {
+            dbPlaylists = pDataPos;
+          }
         }
-      } catch (fErr) {
-        console.warn('Nota al consultar folders en Firestore:', fErr);
+      } catch (_) {}
+
+      // Fallback a tabla 'folders'
+      if (!dbPlaylists || dbPlaylists.length === 0) {
+        try {
+          const { data: fData, error: fErr } = await supabase
+            .from('folders')
+            .select('*')
+            .order('order_index', { ascending: true });
+
+          if (!fErr && fData && fData.length > 0) {
+            dbPlaylists = fData;
+          } else {
+            const { data: fDataPos } = await supabase
+              .from('folders')
+              .select('*')
+              .order('position', { ascending: true });
+
+            if (fDataPos && fDataPos.length > 0) {
+              dbPlaylists = fDataPos;
+            }
+          }
+        } catch (_) {}
       }
 
-      // Obtener y preservar TODAS las carpetas (las por defecto y creadas)
+      // 1. Obtener y preservar TODAS las carpetas (las 12 por defecto y todas las de Telegram/Cloudflare hasta 25+)
       const prevFolders = foldersRef.current && foldersRef.current.length > 0 ? foldersRef.current : carpetasAudio;
       const carpetasMap = new Map<string, AudioFolder>();
 
+      // Primero incorporar las 12 carpetas oficiales por defecto
       for (const f of carpetasAudio) {
         carpetasMap.set(f.id, f);
       }
 
+      // Luego incorporar TODAS las carpetas existentes en memoria / subidas por Telegram o Cloudflare
       for (const f of prevFolders) {
         if (!carpetasMap.has(f.id)) {
           carpetasMap.set(f.id, f);
@@ -1967,6 +2153,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         }
       }
 
+      // Incorporar además carpetas provenientes de la base de datos si existen en tabla 'playlists' o 'folders'
       if (dbPlaylists && dbPlaylists.length > 0) {
         for (const item of dbPlaylists) {
           const existing = carpetasMap.get(item.id);
@@ -1983,39 +2170,44 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         }
       }
 
-      // Asignar portadas automáticas si faltan
+      // 1.5. Asignar automáticamente portada de Unsplash basada en el nombre a las carpetas
+      // y guardar la URL en la tabla de Supabase para que se mantenga al recargar
       for (const folderItem of carpetasMap.values()) {
         const tienePortadaValida =
           (folderItem.coverUrl && (folderItem.coverUrl.startsWith('http://') || folderItem.coverUrl.startsWith('https://'))) ||
           (folderItem.coverKey && (folderItem.coverKey.startsWith('http://') || folderItem.coverKey.startsWith('https://')));
 
         if (!tienePortadaValida) {
+          // Asigna en memoria e inicia el upsert en Supabase en segundo plano
           asignarPortadaAutomaticaCarpeta(folderItem);
         }
       }
 
-      // Carga y aplicación del orden desde Firestore
+      // 2. Carga y aplicación del orden desde la tabla "user_settings" (registro id: "default_user")
       let listaFinal: AudioFolder[] = [];
       try {
-        let orderArray: string[] | null = null;
-        const activeUid = customUserId || (user as any)?.id || user?.uid || auth.currentUser?.uid;
-        if (activeUid) {
-          const userPrefSnap = await getDoc(doc(db, 'user_preferences', activeUid));
-          if (userPrefSnap.exists()) {
-            const raw = userPrefSnap.data()?.playlist_order;
-            if (Array.isArray(raw)) orderArray = raw;
-          }
+        const { data: userSettings, error: usErr } = await supabase
+          .from('user_settings')
+          .select('playlists_order')
+          .eq('id', 'default_user')
+          .maybeSingle();
+
+        if (usErr) {
+          console.warn('Nota al consultar user_settings en Supabase:', usErr.message);
         }
 
-        if (!orderArray) {
-          const globalOrderSnap = await getDoc(doc(db, 'app_settings', 'playlists_order'));
-          if (globalOrderSnap.exists()) {
-            const raw = globalOrderSnap.data()?.playlists_order;
-            if (Array.isArray(raw)) orderArray = raw;
-          }
+        const rawOrder = userSettings?.playlists_order;
+        let orderArray: string[] | null = null;
+        if (Array.isArray(rawOrder)) {
+          orderArray = rawOrder;
+        } else if (typeof rawOrder === 'string') {
+          try {
+            orderArray = JSON.parse(rawOrder);
+          } catch (_) {}
         }
 
         if (orderArray && orderArray.length > 0) {
+          console.log("Aplicando playlists_order desde Supabase:", orderArray);
           const pool = new Map(carpetasMap);
           for (const id of orderArray) {
             const found = pool.get(id);
@@ -2024,26 +2216,30 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
               pool.delete(id);
             }
           }
+          // Si una carpeta de Telegram no está en el array de Supabase, ponerla al final
           for (const rem of pool.values()) {
             listaFinal.push(rem);
           }
         } else {
+          // Si Supabase está vacío, mostrar el orden por defecto
           listaFinal = Array.from(carpetasMap.values());
         }
       } catch (usCatch) {
+        console.warn('Error al consultar user_settings en Supabase, usando orden por defecto:', usCatch);
         listaFinal = Array.from(carpetasMap.values());
       }
 
+      // 3. Actualizar el estado de React con TODAS las carpetas
       setFolders(listaFinal);
       foldersRef.current = listaFinal;
     } catch (err) {
-      console.warn('Nota al cargar carpetas desde Firestore:', err);
+      console.warn('Nota al cargar carpetas desde Supabase:', err);
     }
   };
 
   // ==========================================
-  // SINCRONIZACIÓN FORZADA (REFRESCAR DATOS DESDE FIREBASE)
-  // Vuelve a consultar canciones, carpetas y configuración directamente en Firebase
+  // SINCRONIZACIÓN FORZADA (REFRESCAR DATOS DESDE SUPABASE)
+  // Vuelve a consultar canciones, carpetas y configuración directamente en Supabase
   // ==========================================
   const refrescarDatos = useCallback(async (mostrarFeedback = false) => {
     try {
@@ -2054,10 +2250,10 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         cargarAppSettings()
       ]);
       if (mostrarFeedback) {
-        triggerToast('Datos y orden sincronizados desde Firebase', 'success');
+        triggerToast('Datos y orden sincronizados desde Supabase', 'success');
       }
     } catch (err) {
-      console.warn('Error al sincronizar datos desde Firebase:', err);
+      console.warn('Error al sincronizar datos desde Supabase:', err);
     }
   }, [user]);
   refrescarDatosRef.current = refrescarDatos;
@@ -2768,28 +2964,34 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       return { folderId: existing.id, folderTitle: existing.titulo };
     }
 
-    // Verificar si ya existen canciones con este folder_id en la biblioteca actual
-    const existsInSongs = (songs.length > 0 ? songs : canciones).some(
-      (s) => (s.folder_id || '').toLowerCase() === slug.toLowerCase()
-    );
+    // Consultar en Supabase tabla 'songs' si ya existen registros previos con este folder_id
+    try {
+      const { data: dbMatches } = await supabase
+        .from('songs')
+        .select('folder_id')
+        .eq('folder_id', slug)
+        .limit(1);
 
-    if (existsInSongs) {
-      const coverAuto = obtenerPortadaUnsplashCarpeta(cleanGenre);
-      const recoveredFolder: AudioFolder = {
-        id: slug,
-        titulo: cleanGenre,
-        subtitulo: `Colección de ${cleanGenre}`,
-        descripcion: `Carpeta ${cleanGenre}`,
-        coverKey: coverAuto,
-        coverUrl: coverAuto,
-        badge: cleanGenre,
-        canciones: []
-      };
-      const next = [...todasLasCarpetas.filter((f) => f.id !== slug), recoveredFolder];
-      foldersRef.current = next;
-      saveFolders(next);
-      asignarPortadaAutomaticaCarpeta(recoveredFolder).catch(() => {});
-      return { folderId: slug, folderTitle: cleanGenre };
+      if (dbMatches && dbMatches.length > 0) {
+        const coverAuto = obtenerPortadaUnsplashCarpeta(cleanGenre);
+        const recoveredFolder: AudioFolder = {
+          id: slug,
+          titulo: cleanGenre,
+          subtitulo: `Colección de ${cleanGenre}`,
+          descripcion: `Carpeta ${cleanGenre}`,
+          coverKey: coverAuto,
+          coverUrl: coverAuto,
+          badge: cleanGenre,
+          canciones: []
+        };
+        const next = [...todasLasCarpetas.filter((f) => f.id !== slug), recoveredFolder];
+        foldersRef.current = next;
+        saveFolders(next);
+        asignarPortadaAutomaticaCarpeta(recoveredFolder).catch(() => {});
+        return { folderId: slug, folderTitle: cleanGenre };
+      }
+    } catch (e) {
+      console.warn('Nota consultando estructura de Supabase para género:', e);
     }
 
     // SEGUNDO CASO: Si no existe una carpeta para este género, crearla automáticamente con su portada relacionada
@@ -2836,6 +3038,24 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     setLoadingPreCount(true);
 
     try {
+      // 1. Consultar conteo exacto y real de canciones existentes en Supabase
+      const { data: dbSongs, error: dbErr } = await supabase
+        .from('songs')
+        .select('id, folder_id')
+        .limit(5000);
+
+      if (!dbErr && dbSongs) {
+        const total = dbSongs.length;
+        const tusMeGusta = dbSongs.filter((s: any) => !s.folder_id || s.folder_id === 'tus_me_gusta').length;
+        setTotalSongsToOrganize(total);
+        setTotalTusMeGustaCount(tusMeGusta);
+      } else {
+        const lista = songs.length > 0 ? songs : canciones;
+        setTotalSongsToOrganize(lista.length);
+        setTotalTusMeGustaCount(lista.filter(s => !s.folder_id || s.folder_id === 'tus_me_gusta').length);
+      }
+    } catch (e) {
+      console.warn('Nota consultando conteo previo para organizar biblioteca:', e);
       const lista = songs.length > 0 ? songs : canciones;
       setTotalSongsToOrganize(lista.length);
       setTotalTusMeGustaCount(lista.filter(s => !s.folder_id || s.folder_id === 'tus_me_gusta').length);
@@ -2854,7 +3074,37 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     setIsOrganizingRunning(true);
     setOrganizeStep('processing');
 
-    const allSongsToProcess: Song[] = songs.length > 0 ? [...songs] : [...canciones];
+    let allSongsToProcess: Song[] = [];
+
+    try {
+      // 1. Obtener todas las canciones existentes de la tabla 'songs' en Supabase
+      const { data: dbSongs, error: fetchErr } = await supabase
+        .from('songs')
+        .select('id, title, artist, performer, cover_url, audio_url, created_at, folder_id, genre')
+        .order('created_at', { ascending: false })
+        .limit(5000);
+
+      if (!fetchErr && dbSongs && dbSongs.length > 0) {
+        allSongsToProcess = dbSongs.map((row: any) => ({
+          id: row.id,
+          title: row.title || row.titulo || 'Sin título',
+          artist: row.artist || row.artista || 'Artista',
+          cover_url: row.cover_url || '',
+          audio_url: row.audio_url || '',
+          titulo: row.title || row.titulo || 'Sin título',
+          artista: row.artist || row.artista || 'Artista',
+          url: row.audio_url || '',
+          storage_path: row.audio_url || '',
+          folder_id: row.folder_id || 'tus_me_gusta',
+          created_at: row.created_at
+        }));
+      } else {
+        allSongsToProcess = songs.length > 0 ? [...songs] : [...canciones];
+      }
+    } catch (err) {
+      console.warn('Excepción obteniendo canciones de Supabase para organizar:', err);
+      allSongsToProcess = songs.length > 0 ? [...songs] : [...canciones];
+    }
 
     // Filtrar según el alcance seleccionado por el administrador
     const listaObjetivo = organizeScope === 'tus_me_gusta'
@@ -2999,9 +3249,21 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         // 3. Actualizar folder_id en Supabase si es diferente de la carpeta actual
         const currentFolderId = song.folder_id || 'tus_me_gusta';
         if (currentFolderId !== targetFolderId) {
-            // Actualizar ÚNICAMENTE folder_id en Firestore
-            if (song.id && !String(song.id).startsWith('local_')) {
-              await updateDoc(doc(db, 'songs', String(song.id)), { folder_id: targetFolderId }).catch(() => {});
+          try {
+            // REGLA DE ORO 4: Actualizar ÚNICAMENTE folder_id sin tocar R2, audio_url, portada ni título
+            const { error: updateErr } = await supabase
+              .from('songs')
+              .update({ folder_id: targetFolderId })
+              .eq('id', song.id);
+
+            if (updateErr) {
+              // Si falla por coincidencia de id, actualizar por audio_url
+              if (song.audio_url) {
+                await supabase
+                  .from('songs')
+                  .update({ folder_id: targetFolderId })
+                  .eq('audio_url', song.audio_url);
+              }
             }
 
             clasificadas++;
@@ -3115,12 +3377,29 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     setLimpiandoDuplicados(true);
 
     try {
-      // Filtrar IDs que existan en Firestore
-      const idsFirebase = idsAEliminar.filter((id) => !String(id).startsWith('local_'));
+      // Filtrar IDs que existan en Supabase (evitando IDs locales temporales si los hubiera)
+      const idsSupabase = idsAEliminar.filter((id) => !String(id).startsWith('local_'));
 
-      if (idsFirebase.length > 0) {
-        for (const id of idsFirebase) {
-          await deleteDoc(doc(db, 'songs', String(id))).catch(() => {});
+      if (idsSupabase.length > 0) {
+        // Ejecutar eliminación en la tabla 'songs' de Supabase
+        // Dividimos en bloques de 100 para evitar desbordar URLs o peticiones PostgREST
+        const batchSize = 100;
+        for (let i = 0; i < idsSupabase.length; i += batchSize) {
+          const batch = idsSupabase.slice(i, i + batchSize);
+          const { error: dbError } = await supabase
+            .from('songs')
+            .delete()
+            .in('id', batch);
+
+          if (dbError) {
+            console.error('Error al eliminar duplicados en Supabase:', dbError);
+            throw new Error(dbError.message || 'Error al eliminar registros en Supabase');
+          }
+
+          // Intentar opcionalmente en tabla secundaria 'canciones' si existe en la BD
+          try {
+            await supabase.from('canciones').delete().in('id', batch);
+          } catch (_) {}
         }
       }
 
@@ -3333,15 +3612,9 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     // Clonar lista de canciones para actualizar incrementalmente
     const cancionesActualizadas = [...listaActual];
 
-    const totalBloques = Math.ceil(total / 10);
-
-    // 4. PROCESAMIENTO EN LOTES DE 10 EN 10 CON PAUSA DE 3 SEGUNDOS
-    for (let batchStart = 0; batchStart < total; batchStart += 10) {
-      const batchEnd = Math.min(batchStart + 10, total);
-      const bloqueNumero = Math.floor(batchStart / 10) + 1;
-
-      const mensajeBloque = `Actualizando bloque ${bloqueNumero}...`;
-      triggerToast(mensajeBloque, 'info');
+    // 4. PROCESAMIENTO EN LOTES SEGUROS (de 5 en 5, con 1 segundo de retraso entre cada canción)
+    for (let batchStart = 0; batchStart < total; batchStart += 5) {
+      const batchEnd = Math.min(batchStart + 5, total);
 
       for (let currentIndex = batchStart; currentIndex < batchEnd; currentIndex++) {
         const cancion = cancionesActualizadas[currentIndex];
@@ -3364,11 +3637,11 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         // 1. LIMPIEZA PREVIA
         const nombreLimpio = limpiarNombreArchivo(nombreBase);
 
-        // Actualizar contador del botón: "Procesando bloque X (X/Total)..."
+        // Actualizar contador del botón: "Procesando (X/Total)..."
         setProgresoActualizacion({
           actual: currentIndex + 1,
           total,
-          nombre: `[Bloque ${bloqueNumero}/${totalBloques}] ${nombreLimpio || `Pista ${currentIndex + 1}`}`
+          nombre: nombreLimpio || `Pista ${currentIndex + 1}`
         });
 
         try {
@@ -3386,7 +3659,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           let finalArtista = esArtistaDesconocido ? 'Artista Desconocido' : cleanArtist(artistaActual, 'Artista Desconocido');
           let finalCover = cancion.cover_url || cancion.cover || '';
 
-          // 2. Si el artista es 'Artista Desconocido', busca en la API de iTunes usando solo el título
+          // 2. REGLA 3: Si el artista es 'Artista Desconocido', busca en la API de iTunes usando solo el título
           if (esArtistaDesconocido) {
             try {
               const itunesInfo = await searchCoverInITunes('', finalTitulo);
@@ -3490,7 +3763,8 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
             setCurrentSong(cancionesActualizadas[currentIndex]);
           }
 
-          // 5. GUARDADO EXCLUSIVO EN FIREBASE FIRESTORE
+          // 5. GUARDADO EN FIREBASE FIRESTORE Y SUPABASE PARA QUE QUEDE COMPLETA
+          // Guardar en Firebase Firestore
           try {
             if (cancion.id && !String(cancion.id).startsWith('local_')) {
               await updateDoc(doc(db, 'songs', String(cancion.id)), {
@@ -3520,9 +3794,42 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
             console.warn('Nota guardando en Firebase Firestore:', fbErr);
           }
 
+          // Guardar en Supabase (metadata_cache y tabla songs)
+          const fileId = String(cancion.id || cancion.audio_url || cancion.url || finalTitulo);
+          try {
+            await supabase.from('metadata_cache').upsert({
+              file_id: fileId,
+              titulo: finalTitulo,
+              artista: finalArtista
+            });
+          } catch (errCache) {
+            console.warn('Nota guardando en metadata_cache:', errCache);
+          }
+
+          try {
+            if (cancion.id && !String(cancion.id).startsWith('local_')) {
+              await supabase.from('songs').update({
+                title: finalTitulo,
+                artist: finalArtista,
+                cover_url: finalCover
+              }).eq('id', cancion.id);
+            } else if (cancion.audio_url) {
+              await supabase.from('songs').update({
+                title: finalTitulo,
+                artist: finalArtista,
+                cover_url: finalCover
+              }).eq('audio_url', cancion.audio_url);
+            }
+          } catch (errSongs) {
+            console.warn('Nota actualizando en tabla songs de Supabase:', errSongs);
+          }
+
         } catch (errProcesar) {
           console.warn(`Error procesando canción ${currentIndex + 1} (${nombreLimpio}):`, errProcesar);
         }
+
+        // 4. Retraso obligatorio de 2 segundos entre búsquedas para no saturar la API de iTunes
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
 
       // Guardado por lotes en localStorage
@@ -3532,11 +3839,6 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         localStorage.setItem('spotyy_custom_songs_v1', JSON.stringify(cancionesActualizadas));
         localStorage.setItem('canciones', JSON.stringify(cancionesActualizadas));
       } catch {}
-
-      // Pausa obligatoria de 3 segundos entre bloques de 10
-      if (batchEnd < total) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-      }
     }
 
     // Guardado final asegurado
@@ -3699,18 +4001,35 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
             setCurrentSong(cancionActualizada);
           }
 
-          // Persistir en Firebase Firestore
+          // CRÍTICO (SUPABASE): Persistir en Supabase
           try {
-            if (cancion.id && !String(cancion.id).startsWith('local_')) {
-              await updateDoc(doc(db, 'songs', String(cancion.id)), {
+            const { error: sbUpdateErr } = await supabase
+              .from('songs')
+              .update({
                 title: nuevoTitulo,
                 artist: nuevoArtista,
-                cover_url: nuevaImagen,
-                updated_at: new Date().toISOString()
-              });
+                cover_url: nuevaImagen
+              })
+              .eq('id', cancion.id);
+
+            if (sbUpdateErr) {
+              console.error(`[Supabase] Error actualizando canción "${nuevoTitulo}" (ID: ${cancion.id}):`, sbUpdateErr);
+              if (cancion.audio_url || cancion.url) {
+                const { error: sbErrUrl } = await supabase
+                  .from('songs')
+                  .update({
+                    title: nuevoTitulo,
+                    artist: nuevoArtista,
+                    cover_url: nuevaImagen
+                  })
+                  .eq('audio_url', cancion.audio_url || cancion.url);
+                if (sbErrUrl) {
+                  console.error(`[Supabase Fallback URL] Error actualizando "${nuevoTitulo}":`, sbErrUrl);
+                }
+              }
             }
           } catch (errDb: any) {
-            console.error(`Error en Firestore al actualizar canción "${nuevoTitulo}":`, errDb);
+            console.error(`Error de red en Supabase al actualizar canción "${nuevoTitulo}":`, errDb);
           }
         }
       } catch (errCancion: any) {
@@ -3759,13 +4078,55 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     const numeroCancion = indiceActual >= 0 ? indiceActual + 1 : 1;
     console.log(`[Mover] Moviendo canción #${numeroCancion} ("${song.title || song.titulo}", ID: ${song.id}) a carpeta "${targetFolderId}"...`);
 
-    // 2. Ejecutar UPDATE en Firebase Firestore usando la columna folder_id
+    // 2. Ejecutar UPDATE en Supabase usando la columna exacta folder_id
+    let updateError: any = null;
     try {
+      // Actualizar folder_id en Firestore
       if (song.id && !String(song.id).startsWith('local_')) {
-        await updateDoc(doc(db, 'songs', String(song.id)), { folder_id: targetFolderId }).catch(() => {});
+        updateDoc(doc(db, 'songs', String(song.id)), { folder_id: targetFolderId }).catch(() => {});
       }
-    } catch (fbErr) {
-      console.warn('Nota actualizando folder_id en Firestore:', fbErr);
+
+      // Intentar actualizar por 'id' en la tabla 'songs'
+      const { data: updateData, error: errById } = await supabase
+        .from('songs')
+        .update({ folder_id: targetFolderId })
+        .eq('id', song.id)
+        .select();
+
+      if (errById) {
+        // Si falló por id (por ejemplo si id no es UUID o no coincide) y hay audio_url, intentar por audio_url
+        const rutaAudio = song.audio_url || song.url;
+        if (rutaAudio) {
+          const { error: errByUrl } = await supabase
+            .from('songs')
+            .update({ folder_id: targetFolderId })
+            .eq('audio_url', rutaAudio);
+
+          if (errByUrl) {
+            updateError = errByUrl;
+            console.error(`[Error Supabase] Falló la petición al mover la canción #${numeroCancion} ("${song.title || song.titulo}", ID: ${song.id}) a "${targetFolderId}":`, errByUrl);
+          }
+        } else {
+          updateError = errById;
+          console.error(`[Error Supabase] Falló la petición al mover la canción #${numeroCancion} ("${song.title || song.titulo}", ID: ${song.id}) a "${targetFolderId}":`, errById);
+        }
+      } else if (!updateData || updateData.length === 0) {
+        // Si no arrojó error pero no modificó filas, asegurar actualización por audio_url
+        const rutaAudio = song.audio_url || song.url;
+        if (rutaAudio) {
+          const { error: errByUrl } = await supabase
+            .from('songs')
+            .update({ folder_id: targetFolderId })
+            .eq('audio_url', rutaAudio);
+          if (errByUrl) {
+            updateError = errByUrl;
+            console.error(`[Error Supabase] Falló la petición al mover la canción #${numeroCancion} ("${song.title || song.titulo}", ID: ${song.id}) por audio_url:`, errByUrl);
+          }
+        }
+      }
+    } catch (dbErr) {
+      updateError = dbErr;
+      console.error(`[Error Supabase] Excepción en petición al mover la canción #${numeroCancion} ("${song.title || song.titulo}", ID: ${song.id}) a "${targetFolderId}":`, dbErr);
     }
 
     // 2. Después del UPDATE, actualizar el estado local de React para reflejar el cambio inmediatamente sin recargar
@@ -3914,13 +4275,17 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
   const guardarOrdenReal = async (arrayDeIdsReales: string[]) => {
     console.log("Guardando en Supabase:", arrayDeIdsReales);
     try {
-      await setDoc(
-        doc(db, 'app_settings', 'playlists_order'),
-        { playlists_order: arrayDeIdsReales, updated_at: new Date().toISOString() },
-        { merge: true }
-      );
+      const { data, error } = await supabase
+        .from('user_settings')
+        .upsert({ id: 'default_user', playlists_order: arrayDeIdsReales });
+
+      if (error) {
+        console.error("Error al guardar en Supabase:", error.message || error);
+      } else {
+        console.log("Guardado exitoso en Supabase:", data);
+      }
     } catch (err: any) {
-      console.error("Excepción al guardar en Firestore:", err?.message || err);
+      console.error("Excepción al guardar en Supabase:", err?.message || err);
     }
   };
   const guardarOrdenEnDB = guardarOrdenReal;
@@ -3950,12 +4315,12 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     // Mostrar barra flotante inferior [Guardar] [Deshacer]
     setOrdenModificado(true);
 
-    // Extraer array de IDs REALES en el nuevo orden y persistir en Firestore
+    // Extraer array de IDs REALES en el nuevo orden y hacer el UPSERT en Supabase
     const arrayDeIdsReales = newFolders.map((f) => f.id);
     await guardarOrdenReal(arrayDeIdsReales);
   };
 
-  // 2. Acción Deshacer: regresa al orden anterior y oculta la barra
+  // 2. Acción Deshacer: regresa al orden anterior y oculta la barra sin tocar Supabase ni localStorage
   const deshacerOrdenDesdeBarra = () => {
     if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
       setFolders(ordenPrevioCarpetas);
@@ -3967,7 +4332,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
   };
 
   // 3. Acción Guardar Personal (Todos los usuarios con sesión activa):
-  // Guarda en 'user_preferences' en Firestore
+  // Guarda en 'user_preferences' o con fallback en 'songs' si la tabla aún no existe.
   const guardarOrdenPersonal = async () => {
     if (guardandoOrdenBarra) return;
     setGuardandoOrdenBarra(true);
@@ -3976,7 +4341,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       const activeUid = (user as any)?.id || user?.uid || auth.currentUser?.uid;
 
       if (!activeUid) {
-        alert('⚠️ Debes iniciar sesión con tu cuenta para guardar tu orden personal.');
+        alert('⚠️ Debes iniciar sesión con tu cuenta para guardar tu orden personal en Supabase.');
         if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
           setFolders(ordenPrevioCarpetas);
           foldersRef.current = ordenPrevioCarpetas;
@@ -3988,25 +4353,97 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       }
 
       const playlistOrder = folders.map((f) => f.id);
-      await setDoc(
-        doc(db, 'user_preferences', activeUid),
-        { playlist_order: playlistOrder, updated_at: new Date().toISOString() },
-        { merge: true }
-      );
-      await setDoc(
-        doc(db, 'app_settings', 'playlists_order'),
-        { playlists_order: playlistOrder },
-        { merge: true }
-      );
+      let savedInSupabase = false;
 
+      // 0. Guardar en user_settings (id: default_user)
+      try {
+        await supabase
+          .from('user_settings')
+          .upsert(
+            { id: 'default_user', playlists_order: playlistOrder },
+            { onConflict: 'id' }
+          );
+        savedInSupabase = true;
+      } catch (_) {}
+
+      // 1. Intentar en tabla 'user_preferences' si existe
+      try {
+        const { error: prefErr } = await supabase
+          .from('user_preferences')
+          .upsert(
+            {
+              user_id: activeUid,
+              playlist_order: playlistOrder,
+              updated_at: new Date().toISOString()
+            },
+            { onConflict: 'user_id' }
+          );
+
+        if (!prefErr) {
+          savedInSupabase = true;
+        } else {
+          const { error: updErr } = await supabase
+            .from('user_preferences')
+            .update({
+              playlist_order: playlistOrder,
+              updated_at: new Date().toISOString()
+            })
+            .eq('user_id', activeUid);
+
+          if (!updErr) {
+            savedInSupabase = true;
+          }
+        }
+      } catch (_) {}
+
+      // 2. Fallback de máxima resiliencia en Supabase (tabla 'songs'):
+      // Si la tabla 'user_preferences' no ha sido creada aún en Supabase (PGRST205),
+      // persistir el orden personal en la tabla 'songs' existente en Supabase.
+      try {
+        const userOrderTitle = `__spotyy_user_order__${activeUid}`;
+        const { data: existingUserPref } = await supabase
+          .from('songs')
+          .select('id')
+          .eq('title', userOrderTitle)
+          .maybeSingle();
+
+        if (existingUserPref?.id) {
+          await supabase
+            .from('songs')
+            .update({
+              audio_url: JSON.stringify(playlistOrder),
+              artist: activeUid
+            })
+            .eq('id', existingUserPref.id);
+        } else {
+          await supabase
+            .from('songs')
+            .insert([{
+              title: userOrderTitle,
+              artist: activeUid,
+              audio_url: JSON.stringify(playlistOrder)
+            }]);
+        }
+        savedInSupabase = true;
+      } catch (uErr) {
+        console.warn('Nota guardando orden de usuario en songs:', uErr);
+      }
+
+      if (!savedInSupabase) {
+        throw new Error('No se pudo guardar en Supabase. Verifica tu conexión.');
+      }
+
+      // SOLO si Supabase responde con éxito:
+      // INMEDIATAMENTE DESPUÉS DE GUARDAR, actualizar el estado local de React
       setFolders([...folders]);
       foldersRef.current = [...folders];
       setOrdenModificado(false);
       setOrdenPrevioCarpetas(null);
       triggerToast('Orden guardado en tu perfil. Lo verás cada vez que inicies sesión', 'success');
     } catch (err: any) {
-      console.error('Error al guardar orden personal en Firestore:', err);
-      alert(`⚠️ Error al guardar en Firebase: ${err?.message || 'Fallo de conexión'}. El orden no se guardó.`);
+      console.error('Error al guardar orden personal en Supabase:', err);
+      // Si la petición a Supabase falla, muestra alert y NO cambies el orden en pantalla (revertir al previo)
+      alert(`⚠️ Error al guardar en Supabase: ${err?.message || 'Fallo de conexión'}. El orden no se guardó.`);
       if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
         setFolders(ordenPrevioCarpetas);
         foldersRef.current = ordenPrevioCarpetas;
@@ -4019,7 +4456,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
   };
 
   // 4. Acción Guardar Global (Solo Administrador):
-  // Actualiza la posición de las carpetas en Firestore
+  // Actualiza la posición de las carpetas en Supabase (playlists / folders / songs).
   const guardarOrdenGlobal = async () => {
     if (guardandoOrdenBarra) return;
     if (!isAdmin) {
@@ -4030,20 +4467,98 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
     try {
       const playlistOrder = folders.map((f) => f.id);
-      await setDoc(
-        doc(db, 'app_settings', 'playlists_order'),
-        { playlists_order: playlistOrder, updated_at: new Date().toISOString() },
-        { merge: true }
-      );
+      const playlistUpdates = folders.map((f, index) => ({
+        id: f.id,
+        titulo: f.titulo,
+        title: f.titulo,
+        subtitulo: f.subtitulo || '',
+        descripcion: f.descripcion || '',
+        cover_key: f.coverKey || '',
+        badge: f.badge || '',
+        order_index: index,
+        position: index,
+        order: index,
+        updated_at: new Date().toISOString()
+      }));
 
+      let savedGlobally = false;
+
+      // 0. Guardar en user_settings (id: default_user)
+      try {
+        await supabase
+          .from('user_settings')
+          .upsert(
+            { id: 'default_user', playlists_order: playlistOrder },
+            { onConflict: 'id' }
+          );
+        savedGlobally = true;
+      } catch (_) {}
+
+      // 1. Intentar actualizar tabla dedicada 'playlists' si existe
+      try {
+        const { error: pErr } = await supabase
+          .from('playlists')
+          .upsert(playlistUpdates, { onConflict: 'id' });
+        if (!pErr) {
+          savedGlobally = true;
+        }
+      } catch (_) {}
+
+      // 2. Intentar actualizar tabla dedicada 'folders' si existe
+      try {
+        const { error: fErr } = await supabase
+          .from('folders')
+          .upsert(playlistUpdates, { onConflict: 'id' });
+        if (!fErr) {
+          savedGlobally = true;
+        }
+      } catch (_) {}
+
+      // 3. Fallback de máxima resiliencia en Supabase (tabla 'songs'):
+      // Si 'playlists' o 'folders' aún no existen en el proyecto de Supabase (PGRST205),
+      // persistir el orden global de forma permanente en la tabla 'songs' existente en Supabase.
+      try {
+        const { data: existingConfig } = await supabase
+          .from('songs')
+          .select('id')
+          .eq('title', '__spotyy_global_order__')
+          .maybeSingle();
+
+        if (existingConfig?.id) {
+          await supabase
+            .from('songs')
+            .update({
+              audio_url: JSON.stringify(playlistOrder),
+              artist: '__config__'
+            })
+            .eq('id', existingConfig.id);
+        } else {
+          await supabase
+            .from('songs')
+            .insert([{
+              title: '__spotyy_global_order__',
+              artist: '__config__',
+              audio_url: JSON.stringify(playlistOrder)
+            }]);
+        }
+        savedGlobally = true;
+      } catch (sErr) {
+        console.warn('Nota guardando orden global en songs:', sErr);
+      }
+
+      if (!savedGlobally) {
+        throw new Error('No se pudo guardar en Supabase. Verifica tu conexión.');
+      }
+
+      // SOLO si Supabase responde con éxito:
       setFolders([...folders]);
       foldersRef.current = [...folders];
       setOrdenModificado(false);
       setOrdenPrevioCarpetas(null);
       triggerToast('Orden global actualizado para toda la aplicación', 'success');
     } catch (err: any) {
-      console.error('Error al guardar orden global en Firestore:', err);
-      alert(`⚠️ Error al guardar orden global en Firebase: ${err?.message || 'Fallo de conexión'}. El orden no se guardó.`);
+      console.error('Error al guardar orden global en Supabase:', err);
+      alert(`⚠️ Error al guardar orden global en Supabase: ${err?.message || 'Fallo de conexión'}. El orden no se guardó.`);
       if (ordenPrevioCarpetas && ordenPrevioCarpetas.length > 0) {
         setFolders(ordenPrevioCarpetas);
         foldersRef.current = ordenPrevioCarpetas;
@@ -4055,12 +4570,17 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     }
   };
 
-  // 5. Acción Restablecer Orden: Elimina preferencia del usuario en Firestore y vuelve al orden global
+  // 5. Acción Restablecer Orden: Elimina preferencia del usuario en Supabase y vuelve al orden global
   const restablecerOrden = async () => {
     try {
       const activeUid = (user as any)?.id || user?.uid || auth.currentUser?.uid;
       if (activeUid) {
-        await deleteDoc(doc(db, 'user_preferences', activeUid)).catch(() => {});
+        try {
+          await supabase.from('user_preferences').delete().eq('user_id', activeUid);
+        } catch (_) {}
+        try {
+          await supabase.from('songs').delete().eq('title', `__spotyy_user_order__${activeUid}`);
+        } catch (_) {}
       }
       await cargarCarpetasDesdeSupabase(undefined, true);
       triggerToast('Orden personal restablecido al global', 'success');
@@ -4274,10 +4794,15 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       setCurrentSong(restantes.length > 0 ? restantes[0] : null);
     }
 
-    // 6. Eliminar en Firestore en segundo plano si aplica
+    // 6. Eliminar en Supabase en segundo plano si aplica
     try {
+      if (song.storage_path) {
+        supabase.storage.from('musica').remove([song.storage_path]).then(null, () => {});
+      }
       if (!songIdStr.startsWith('local_')) {
         deleteDoc(doc(db, 'songs', String(song.id))).catch(() => {});
+        supabase.from('songs').delete().eq('id', song.id).then(null, () => {});
+        supabase.from('canciones').delete().eq('id', song.id).then(null, () => {});
       }
     } catch {}
 
@@ -4414,6 +4939,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
     try {
       if (song.storage_path) {
+        await supabase.storage.from('musica').remove([song.storage_path]);
         try {
           const metadatos = obtenerMetadatosLocales();
           delete metadatos[song.storage_path];
@@ -4422,9 +4948,11 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
       }
       if (!String(song.id).startsWith('local_')) {
         await deleteDoc(doc(db, 'songs', String(song.id))).catch(() => {});
+        await supabase.from('songs').delete().eq('id', song.id);
+        await supabase.from('canciones').delete().eq('id', song.id);
       }
     } catch (err: unknown) {
-      console.warn('Nota al eliminar de Firestore:', err);
+      console.warn('Nota al eliminar de Supabase:', err);
     }
     triggerToast(`"${song.titulo}" ha sido eliminada permanentemente.`, 'success');
   };
@@ -4490,23 +5018,34 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
             throw r2Err;
           }
 
-          // 2. Guardar en Firebase colección 'songs' asignando el folder_id
+          // 2. Guardar en Supabase tabla 'songs' asignando el folder_id con UTF-8
           let dbRecord: any = null;
           try {
-            const nuevaCancionPayload = {
-              title: fixUtf8Encoding(songTitle),
-              artist: fixUtf8Encoding(songArtist),
-              cover_url: cover,
-              audio_url: publicUrl,
-              url: publicUrl,
-              storage_path: publicUrl,
-              folder_id: currentFolderId,
-              created_at: new Date().toISOString()
-            };
-            const docRef = await addDoc(collection(db, 'songs'), nuevaCancionPayload);
-            dbRecord = { id: docRef.id, ...nuevaCancionPayload };
-          } catch (fbErr: any) {
-            console.error('Error al guardar en Firebase:', fbErr);
+            const { data: songInserted, error: insertError } = await supabase
+              .from('songs')
+              .insert([
+                {
+                  title: fixUtf8Encoding(songTitle),
+                  artist: fixUtf8Encoding(songArtist),
+                  cover_url: cover,
+                  audio_url: publicUrl,
+                  folder_id: currentFolderId
+                }
+              ])
+              .select()
+              .single();
+
+            if (insertError) {
+              console.error('Error al insertar en Supabase con folder_id:', insertError);
+              alert(
+                `Error al guardar en Supabase:\n\n${insertError.message || JSON.stringify(insertError)}`
+              );
+            } else {
+              dbRecord = songInserted;
+            }
+          } catch (supaErr: any) {
+            console.error('Excepción al guardar en Supabase:', supaErr);
+            alert(`Error de red o conexión con Supabase:\n\n${supaErr?.message || supaErr}`);
           }
 
           const nuevaCancion: Song = {
@@ -4715,8 +5254,8 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
         throw r2Error;
       }
 
-      // 2. INSERT en Firebase Firestore en la colección 'songs'
-      setUploadStatus(`Guardando "${songTitle}" en Firebase...`);
+      // 2. INSERT en Firestore en la colección 'songs' (con fallback a Supabase)
+      setUploadStatus(`Guardando "${songTitle}" en Firestore...`);
       let dbRecord: any = null;
       try {
         const songData = {
@@ -4724,16 +5263,31 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           artist: fixUtf8Encoding(songArtist),
           cover_url: finalCover,
           audio_url: publicUrl,
-          url: publicUrl,
-          storage_path: publicUrl,
           folder_id: destFolder,
           created_at: new Date().toISOString()
         };
         const docRef = await addDoc(collection(db, 'songs'), songData);
         dbRecord = { id: docRef.id, ...songData };
       } catch (insertErr: any) {
-        console.error('Error guardando en Firebase Firestore:', insertErr);
-        throw insertErr;
+        console.warn('Nota guardando en Firestore, intentando Supabase:', insertErr);
+        try {
+          const { data: songInserted } = await supabase
+            .from('songs')
+            .insert([
+              {
+                title: fixUtf8Encoding(songTitle),
+                artist: fixUtf8Encoding(songArtist),
+                cover_url: finalCover,
+                audio_url: publicUrl,
+                folder_id: destFolder
+              }
+            ])
+            .select()
+            .single();
+          if (songInserted) {
+            dbRecord = songInserted;
+          }
+        } catch (_) {}
       }
 
       const nuevaCancion: Song = {
@@ -4944,23 +5498,47 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
 
         const ruta = finalAudioUrl;
 
-        // 2. Insertar en Firebase Firestore colección 'songs'
+        // 2. Insertar en Firestore en la colección 'songs'
         let dbId: string | undefined;
+        let insertFailed = false;
         try {
           const songPayload = {
             title: fixUtf8Encoding(songTitle),
             artist: fixUtf8Encoding(songArtist),
             cover_url: cover,
             audio_url: finalAudioUrl,
-            url: finalAudioUrl,
-            storage_path: finalAudioUrl,
             folder_id: fileDestFolder,
             created_at: new Date().toISOString()
           };
           const docRef = await addDoc(collection(db, 'songs'), songPayload);
           dbId = docRef.id;
         } catch (fErr) {
-          console.error('Error guardando en Firebase Firestore:', fErr);
+          console.warn('Nota guardando en Firestore, intentando Supabase fallback:', fErr);
+          try {
+            const { data: songInserted } = await supabase
+              .from('songs')
+              .insert([
+                {
+                  title: fixUtf8Encoding(songTitle),
+                  artist: fixUtf8Encoding(songArtist),
+                  cover_url: cover,
+                  audio_url: finalAudioUrl,
+                  folder_id: fileDestFolder
+                }
+              ])
+              .select()
+              .single();
+            if (songInserted?.id) {
+              dbId = songInserted.id;
+            }
+          } catch (e) {
+            insertFailed = true;
+          }
+        }
+
+        if (insertFailed && !dbId) {
+          triggerToast(`Error al guardar "${songTitle}". No fue registrada.`, 'error');
+          continue;
         }
 
         const cancion: Song = {
@@ -6537,7 +7115,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
           <div className="w-4 h-4 border-2 border-[#1ED760] border-t-transparent rounded-full animate-spin" />
           <p className="text-sm font-bold text-white tracking-wide">Cargando música y playlists...</p>
         </div>
-        <p className="text-xs text-gray-400">Sincronizando archivos con Firebase</p>
+        <p className="text-xs text-gray-400">Sincronizando archivos y orden con Supabase</p>
       </div>
     );
   }

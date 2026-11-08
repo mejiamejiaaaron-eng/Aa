@@ -1,7 +1,6 @@
 import * as mm from 'music-metadata-browser';
 import { uploadCoverToR2 } from './r2Client';
-import { db } from './firebase';
-import { doc, setDoc } from 'firebase/firestore';
+import { supabase } from './supabase';
 
 // Portada por defecto de alta fidelidad para canciones sin portada en iTunes
 export const DEFAULT_SONG_COVER = 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=600&auto=format&fit=crop&q=80';
@@ -553,7 +552,7 @@ export async function asignarPortadaAutomaticaCarpeta(folder: FolderLike): Promi
   folder.coverKey = portadaGenerada;
   folder.coverUrl = portadaGenerada;
 
-  // 4. Guardar en Firebase Firestore para persistencia al recargar
+  // 4. Guardar en Supabase para persistencia al recargar
   try {
     const payload = {
       id: folder.id,
@@ -566,9 +565,12 @@ export async function asignarPortadaAutomaticaCarpeta(folder: FolderLike): Promi
       updated_at: new Date().toISOString()
     };
 
-    await setDoc(doc(db, 'folders', folder.id), payload, { merge: true }).catch(() => {});
+    const { error: errFolders } = await supabase.from('folders').upsert(payload, { onConflict: 'id' });
+    if (errFolders) {
+      await supabase.from('playlists').upsert(payload, { onConflict: 'id' });
+    }
   } catch (errDb) {
-    console.warn('Nota guardando portada automática de carpeta en Firebase:', errDb);
+    console.warn('Nota guardando portada automática de carpeta en Supabase:', errDb);
   }
 
   return portadaGenerada;
